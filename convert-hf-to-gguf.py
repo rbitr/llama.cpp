@@ -14,14 +14,15 @@ from typing import TYPE_CHECKING, Any, ContextManager, Iterator, cast
 
 import numpy as np
 import torch
+from collections import OrderedDict
 
 if TYPE_CHECKING:
     from torch import Tensor
 
-if 'NO_LOCAL_GGUF' not in os.environ:
-    sys.path.insert(1, str(Path(__file__).parent / 'gguf-py'))
+# hard code because we don't want to use the pypi module
+#if 'NO_LOCAL_GGUF' not in os.environ:
+sys.path.insert(0, str(Path(__file__).parent / 'gguf-py'))
 import gguf
-
 
 ###### MODEL DEFINITIONS ######
 
@@ -166,6 +167,8 @@ class Model:
             return RefactModel
         if model_architecture == "PersimmonForCausalLM":
             return PersimmonModel
+        if model_architecture == "DistilBertModel":
+            return DistilBertModel
         if model_architecture in ("StableLMEpochForCausalLM", "LlavaStableLMEpochForCausalLM"):
             return StableLMModel
         return Model
@@ -203,6 +206,8 @@ class Model:
             return gguf.MODEL_ARCH.PERSIMMON
         if arch in ("StableLMEpochForCausalLM", "LlavaStableLMEpochForCausalLM"):
             return gguf.MODEL_ARCH.STABLELM
+        if arch == "DistilBertModel":
+            return gguf.MODEL_ARCH.DISTILBERT
 
         raise NotImplementedError(f'Architecture "{arch}" not supported!')
 
@@ -241,6 +246,7 @@ class Model:
 
         special_vocab = gguf.SpecialVocab(dir_model, load_merges=True)
         special_vocab.add_to_gguf(self.gguf_writer)
+
 
     def _set_vocab_sentencepiece(self):
         from sentencepiece import SentencePieceProcessor
@@ -688,6 +694,57 @@ class StarCoderModel(Model):
         self.gguf_writer.add_head_count(self.hparams["n_head"])
         self.gguf_writer.add_head_count_kv(1)
         self.gguf_writer.add_layer_norm_eps(self.hparams["layer_norm_epsilon"])
+        self.gguf_writer.add_file_type(self.ftype)
+
+
+class DistilBertModel(Model):
+
+    def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
+        for part_name in self.part_names:
+            print(f"gguf: loading model part '{part_name}'")
+            ctx: ContextManager[Any]
+            if self.is_safetensors:
+                raise NotImplementedError(f'Safetensors not supported for Distilbert')
+            else:
+            # load modules as in https://github.com/UKPLab/sentence-transformers/blob/master/sentence_transformers/SentenceTransformer.py 
+                from sentence_transformers.util import import_from_string
+                modules_json_path = os.path.join(self.dir_model, 'modules.json')
+                with open(modules_json_path) as fIn:
+                    modules_config = json.load(fIn)
+
+                modules = OrderedDict()
+                for module_config in modules_config:
+                    module_class = import_from_string(module_config['type'])
+                    module = module_class.load(os.path.join(self.dir_model, module_config['path']))
+                    modules[module_config['name']] = module
+                
+                sd = torch.nn.Sequential(modules).state_dict()
+                # deep copy
+                keys = [k for k in sd.keys()]
+                for k in keys:
+                    key_chunks = k.split(".")[1:]
+                    newkey = ".".join([c for c in key_chunks if c != "auto_model"])
+                    sd[newkey] = sd.pop(k)
+                
+                ctx = contextlib.nullcontext(sd)
+
+            with ctx as model_part:
+                for name in model_part.keys():
+                    data = model_part.get_tensor(name) if self.is_safetensors else model_part[name]
+                    yield name, data
+
+
+    def set_gguf_parameters(self):
+        block_count = self.hparams["n_layers"]
+
+        self.gguf_writer.add_name("DistilBert")
+        self.gguf_writer.add_context_length(self.hparams["max_position_embeddings"])
+        self.gguf_writer.add_embedding_length(self.hparams["dim"])
+        self.gguf_writer.add_feed_forward_length(self.hparams["hidden_dim"])
+        self.gguf_writer.add_block_count(block_count)
+        self.gguf_writer.add_head_count(self.hparams["n_heads"])
+        self.gguf_writer.add_head_count_kv(1)
+        #self.gguf_writer.add_layer_norm_eps(self.hparams["layer_norm_epsilon"])
         self.gguf_writer.add_file_type(self.ftype)
 
 
